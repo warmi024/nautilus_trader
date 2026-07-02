@@ -11954,3 +11954,133 @@ class TestOrderMatchingEngineQuoteQuantity:
         assert len(updates) == 0
         assert len(fills) == 1
         assert order.is_quote_quantity is True
+
+
+class TestOrderMatchingEngineL3QueuePosition:
+    # Per-order queue-position fidelity on L3 (MBO) data.
+    #
+    # With `queue_position=True`, `_clear_queue_on_delete` previously cleared an order's
+    # ENTIRE quantity-ahead on ANY per-order DELETE at its price/side. On an L3 feed every
+    # stranger's cancel is a per-order DELETE, so a single unrelated cancel front-of-queued
+    # the order and the next trade filled it early -- contradicting the `queue_position`
+    # docstring, which clears only when the price LEVEL is deleted. The engine now tracks
+    # the identity (order_ids) of the orders resting ahead and advances only when a specific
+    # one is genuinely gone. These tests pin that behaviour (they fail on the old heuristic).
+
+    def setup(self):
+        self.clock = TestClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(
+            trader_id=self.trader_id,
+            clock=self.clock,
+        )
+        self.instrument = _ETHUSDT_PERP_BINANCE
+        self.account_id = TestIdStubs.account_id()
+        self.cache = TestComponentStubs.cache()
+        self.cache.add_instrument(self.instrument)
+
+    def _engine(self) -> OrderMatchingEngine:
+        return OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=FillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L3_MBO,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=True,
+            queue_position=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+    def _delta(self, engine, action, order_id, price, qty, sequence):
+        engine.process_order_book_delta(
+            OrderBookDelta(
+                instrument_id=self.instrument.id,
+                action=action,
+                order=BookOrder(OrderSide.SELL, Price.from_str(price), Quantity.from_str(qty), order_id),
+                flags=0,
+                sequence=sequence,
+                ts_event=sequence,
+                ts_init=sequence,
+            ),
+        )
+
+    def _rest_behind_two_strangers(self, engine, messages):
+        # Two strangers (5 + 5 = 10) rest on the ask at 100.00, then our SELL 5 rests
+        # behind them by time priority (snapshot quantity-ahead = 10).
+        self._delta(engine, BookAction.ADD, 1, "100.00", "5.000", 1)
+        self._delta(engine, BookAction.ADD, 2, "100.00", "5.000", 2)
+        order = TestExecStubs.limit_order(
+            instrument=self.instrument,
+            order_side=OrderSide.SELL,
+            price=Price.from_str("100.00"),
+            quantity=self.instrument.make_qty(5.0),
+        )
+        engine.process_order(order, self.account_id)
+        messages.clear()  # drop accept events; only fills matter below
+
+    def _trade(self, engine, size):
+        engine.process_trade_tick(
+            TestDataStubs.trade_tick(
+                instrument=self.instrument,
+                price=100.0,
+                size=size,
+                aggressor_side=AggressorSide.BUYER,
+            ),
+        )
+
+    def test_stranger_cancel_does_not_front_run(self) -> None:
+        # 10 ahead; one stranger cancels (5 left); a 5-lot trade consumes only that -> NO fill.
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._delta(engine, BookAction.DELETE, 1, "100.00", "5.000", 3)
+        self._trade(engine, 5.0)
+
+        assert [m for m in messages if isinstance(m, OrderFilled)] == []
+
+    def test_exact_consume_does_not_fill(self) -> None:
+        # 10 ahead; a 10-lot trade consumes the strangers exactly -> no overflow -> NO fill.
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._trade(engine, 10.0)
+
+        assert [m for m in messages if isinstance(m, OrderFilled)] == []
+
+    def test_overflow_fills_the_remainder(self) -> None:
+        # 10 ahead; a 15-lot trade clears 10 and overflows 5 into us -> fill 5.
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._trade(engine, 15.0)
+
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert len(fills) == 1
+        assert fills[0].last_qty == self.instrument.make_qty(5.0)
+
+    def test_genuine_cancels_advance_then_fill(self) -> None:
+        # Both strangers genuinely cancel -> we are at the front -> a 5-lot trade fills us
+        # (the fix is not over-conservative).
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._delta(engine, BookAction.DELETE, 1, "100.00", "5.000", 3)
+        self._delta(engine, BookAction.DELETE, 2, "100.00", "5.000", 4)
+        self._trade(engine, 5.0)
+
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert len(fills) == 1
+        assert fills[0].last_qty == self.instrument.make_qty(5.0)

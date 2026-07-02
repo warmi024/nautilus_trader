@@ -150,6 +150,7 @@ from nautilus_trader.execution.messages cimport TradingCommand
 from nautilus_trader.execution.trailing cimport TrailingStopCalculator
 from nautilus_trader.model.book cimport BookLevel
 from nautilus_trader.model.book cimport OrderBook
+from nautilus_trader.model.data cimport BookOrder
 from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport BarType
 from nautilus_trader.model.data cimport CustomData
@@ -4078,6 +4079,7 @@ cdef class OrderMatchingEngine:
         self._last_trade_size: Quantity | None = None
         self._fill_at_market = True  # Fill stop orders at market price vs trigger price
         self._queue_ahead = {}
+        self._queue_ahead_ids = {}  # L3: client_order_id -> {order_id: size_raw} resting ahead (FIFO)
         self._queue_excess = {}
         self._queue_pending = {}
         self._bid_consumption = {}
@@ -4130,6 +4132,7 @@ cdef class OrderMatchingEngine:
         self._last_ask_bar = None
         self._last_trade_size = None
         self._queue_ahead.clear()
+        self._queue_ahead_ids.clear()
         self._queue_excess.clear()
         self._queue_pending.clear()
         self._bid_consumption.clear()
@@ -4332,7 +4335,7 @@ cdef class OrderMatchingEngine:
                 self._bid_consumption.pop(delta._mem.order.price.raw, None)
 
         if self._queue_position and delta._mem.action == BookAction.DELETE:
-            self._clear_queue_on_delete(delta._mem.order.price.raw, delta._mem.order.side)
+            self._clear_queue_on_delete(delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side)
 
         self._book.apply_delta(delta)
 
@@ -4398,7 +4401,7 @@ cdef class OrderMatchingEngine:
                     self._bid_consumption.pop(delta._mem.order.price.raw, None)
 
             if self._queue_position and delta._mem.action == BookAction.DELETE:
-                self._clear_queue_on_delete(delta._mem.order.price.raw, delta._mem.order.side)
+                self._clear_queue_on_delete(delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side)
 
         # Reset consumption tracking on snapshot (F_SNAPSHOT = 32) or CLEAR action
         if self._liquidity_consumption and has_snapshot_or_clear:
@@ -7020,6 +7023,7 @@ cdef class OrderMatchingEngine:
         # Clear stale entries from both maps (e.g. order modified to new price)
         self._queue_pending.pop(order.client_order_id, None)
         self._queue_ahead.pop(order.client_order_id, None)
+        self._queue_ahead_ids.pop(order.client_order_id, None)
 
         # For L1 books, levels behind the BBO have no visible depth. Track
         # these orders separately so fills are blocked until the BBO reaches
@@ -7041,24 +7045,79 @@ cdef class OrderMatchingEngine:
                 self._queue_pending[order.client_order_id] = price._mem.raw
                 return
 
+        # L3 (per-order identity): record the order_ids resting ahead of us in FIFO order,
+        # so a per-order DELETE advances us only if that specific order was genuinely ahead
+        # (not on any delete at the level, which is optimistic). Mirrors queue_model.py.
+        cdef dict ahead_ids
+        if self.book_type == BookType.L3_MBO:
+            ahead_ids = self._collect_ahead_ids(order.side, price)
+            self._queue_ahead_ids[order.client_order_id] = ahead_ids
+            ahead_raw = self._sum_ahead_ids(ahead_ids)
+
         self._queue_ahead[order.client_order_id] = (price._mem.raw, ahead_raw)
 
-    cdef void _clear_queue_on_delete(self, PriceRaw deleted_price_raw, OrderSide deleted_side):
+    cdef dict _collect_ahead_ids(self, OrderSide order_side, Price price):
+        # Orders resting ahead of ours at `price` on our own side, in book (FIFO) order.
+        # Our own simulated order is not in the book, so every order at this level is ahead.
+        cdef:
+            list levels
+            PriceRaw target = price._mem.raw
+            dict ahead = {}
+            BookLevel level
+            BookOrder o
+            Price level_price
+        if order_side == OrderSide.BUY:
+            levels = self._book.bids()
+        else:
+            levels = self._book.asks()
+        for level in levels:
+            level_price = level.price
+            if level_price._mem.raw == target:
+                for o in level.orders():
+                    ahead[o._mem.order_id] = o._mem.size.raw
+                break
+        return ahead
+
+    cdef QuantityRaw _sum_ahead_ids(self, dict ahead_ids):
+        cdef:
+            QuantityRaw total = 0
+            QuantityRaw size
+        for size in ahead_ids.values():
+            total += size
+        return total
+
+    cdef void _clear_queue_on_delete(self, uint64_t deleted_order_id, PriceRaw deleted_price_raw, OrderSide deleted_side):
         cdef:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
             Order order
+            dict ahead_ids
         for client_order_id in list(self._queue_ahead):
             order_price_raw, _ = self._queue_ahead[client_order_id]
-            if order_price_raw == deleted_price_raw:
-                order = self._core.get_order(client_order_id)
-                if order is not None and order.side == deleted_side:
-                    self._queue_ahead[client_order_id] = (order_price_raw, 0)
+            if order_price_raw != deleted_price_raw:
+                continue
+            order = self._core.get_order(client_order_id)
+            if order is None or order.side != deleted_side:
+                continue
+            ahead_ids = self._queue_ahead_ids.get(client_order_id)
+            if ahead_ids is not None:
+                # L3: advance ONLY if the deleted order was genuinely ahead of us. A delete
+                # of an order behind us (or not tracked) leaves our position unchanged.
+                if deleted_order_id in ahead_ids:
+                    del ahead_ids[deleted_order_id]
+                    self._queue_ahead[client_order_id] = (order_price_raw, self._sum_ahead_ids(ahead_ids))
+            else:
+                # Non-L3 (no per-order identity): preserve the legacy clear-on-delete.
+                self._queue_ahead[client_order_id] = (order_price_raw, 0)
 
     cdef void _clear_all_queue_positions(self):
+        # On a snapshot/CLEAR the prior depth (and per-order identity) no longer exists.
+        # Drop tracked identity; orders revert to front (as in the legacy behavior). L3
+        # snapshots occur at session start, before our orders rest, so this is benign.
         cdef:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
+        self._queue_ahead_ids.clear()
         for client_order_id in list(self._queue_ahead):
             order_price_raw, _ = self._queue_ahead[client_order_id]
             self._queue_ahead[client_order_id] = (order_price_raw, 0)
@@ -7071,6 +7130,10 @@ cdef class OrderMatchingEngine:
             PriceRaw order_price_raw
             QuantityRaw ahead_raw
             QuantityRaw new_ahead
+            QuantityRaw remaining
+            QuantityRaw sz
+            dict ahead_ids
+            object oid
             Order order
         for client_order_id in list(self._queue_ahead):
             order_price_raw, ahead_raw = self._queue_ahead[client_order_id]
@@ -7078,6 +7141,7 @@ cdef class OrderMatchingEngine:
             order = self._core.get_order(client_order_id)
             if order is None or order.is_closed_c():
                 self._queue_ahead.pop(client_order_id, None)
+                self._queue_ahead_ids.pop(client_order_id, None)
                 continue
 
             if order_price_raw == price_raw and ahead_raw > 0:
@@ -7085,15 +7149,35 @@ cdef class OrderMatchingEngine:
                 if aggressor_side == AggressorSide.NO_AGGRESSOR or \
                    (aggressor_side == AggressorSide.BUYER and order.side == OrderSide.SELL) or \
                    (aggressor_side == AggressorSide.SELLER and order.side == OrderSide.BUY):
-                    if ahead_raw > trade_size_raw:
-                        new_ahead = ahead_raw - trade_size_raw
+                    ahead_ids = self._queue_ahead_ids.get(client_order_id)
+                    if ahead_ids is not None:
+                        # L3: the aggressor consumes resting orders strictly front-first
+                        # (time priority), so everyone ahead of us clears before we fill.
+                        remaining = trade_size_raw
+                        for oid in list(ahead_ids):
+                            if remaining <= 0:
+                                break
+                            sz = ahead_ids[oid]
+                            if sz <= remaining:
+                                remaining -= sz
+                                del ahead_ids[oid]
+                            else:
+                                ahead_ids[oid] = sz - remaining
+                                remaining = 0
+                        new_ahead = self._sum_ahead_ids(ahead_ids)
+                        self._queue_ahead[client_order_id] = (order_price_raw, new_ahead)
+                        if new_ahead == 0:
+                            self._queue_excess[client_order_id] = remaining
                     else:
-                        new_ahead = 0
+                        if ahead_raw > trade_size_raw:
+                            new_ahead = ahead_raw - trade_size_raw
+                        else:
+                            new_ahead = 0
 
-                    self._queue_ahead[client_order_id] = (order_price_raw, new_ahead)
+                        self._queue_ahead[client_order_id] = (order_price_raw, new_ahead)
 
-                    if new_ahead == 0:
-                        self._queue_excess[client_order_id] = trade_size_raw - ahead_raw
+                        if new_ahead == 0:
+                            self._queue_excess[client_order_id] = trade_size_raw - ahead_raw
 
     cdef void _seed_tob_baseline(self):
         cdef Price bid_price = self._book.best_bid_price()

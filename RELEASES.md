@@ -39,6 +39,7 @@ releases as feedback arrives, before the final `2.0.0` release.
 - Fixed Binance Futures external algo order materialization (#4348), thanks for reporting @linimin
 - Fixed `PerContractFeeModel` generic spread fees to charge per leg ratio (#4360), thanks for reporting @pjlegato
 - Fixed Redis message bus startup with Python v2 configs (#4356), thanks for reporting @davidgreyme
+- Fixed backtest `queue_position` clearing an order's entire quantity-ahead on any per-order `DELETE`, which front-ran resting orders on L3 (MBO) books; the queue now tracks per-order identity and advances only when a specific order ahead is removed
 
 ### Internal Improvements
 - Upgraded `redis` crate to v1.3.0

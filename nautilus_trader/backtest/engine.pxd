@@ -420,6 +420,7 @@ cdef class OrderMatchingEngine:
     cdef Quantity _last_trade_size
     cdef bint _fill_at_market
     cdef dict[ClientOrderId, tuple[PriceRaw, QuantityRaw]] _queue_ahead
+    cdef dict _queue_ahead_ids
     cdef dict[ClientOrderId, QuantityRaw] _queue_excess
     cdef dict[ClientOrderId, PriceRaw] _queue_pending
     cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] _bid_consumption
@@ -531,7 +532,9 @@ cdef class OrderMatchingEngine:
     cdef void _trail_stop_order(self, Order order)
 
     cdef void _snapshot_queue_position(self, Order order, Price price)
-    cdef void _clear_queue_on_delete(self, PriceRaw deleted_price_raw, OrderSide deleted_side)
+    cdef dict _collect_ahead_ids(self, OrderSide order_side, Price price)
+    cdef QuantityRaw _sum_ahead_ids(self, dict ahead_ids)
+    cdef void _clear_queue_on_delete(self, uint64_t deleted_order_id, PriceRaw deleted_price_raw, OrderSide deleted_side)
     cdef void _clear_all_queue_positions(self)
     cdef void _decrement_queue_on_trade(self, PriceRaw price_raw, QuantityRaw trade_size_raw, AggressorSide aggressor_side)
     cdef void _seed_tob_baseline(self)
