@@ -535,6 +535,7 @@ cdef class OrderMatchingEngine:
     cdef dict _collect_ahead_ids(self, OrderSide order_side, Price price)
     cdef QuantityRaw _sum_ahead_ids(self, dict ahead_ids)
     cdef void _clear_queue_on_delete(self, uint64_t deleted_order_id, PriceRaw deleted_price_raw, OrderSide deleted_side)
+    cdef void _update_queue_on_change(self, uint64_t updated_order_id, PriceRaw updated_price_raw, OrderSide updated_side, QuantityRaw new_size_raw)
     cdef void _clear_all_queue_positions(self)
     cdef void _decrement_queue_on_trade(self, PriceRaw price_raw, QuantityRaw trade_size_raw, AggressorSide aggressor_side)
     cdef void _seed_tob_baseline(self)

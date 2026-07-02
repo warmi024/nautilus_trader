@@ -4079,7 +4079,7 @@ cdef class OrderMatchingEngine:
         self._last_trade_size: Quantity | None = None
         self._fill_at_market = True  # Fill stop orders at market price vs trigger price
         self._queue_ahead = {}
-        self._queue_ahead_ids = {}  # L3: client_order_id -> {order_id: size_raw} resting ahead (FIFO)
+        self._queue_ahead_ids = {}  # L3: client_order_id -> {order_id: size_raw ahead}
         self._queue_excess = {}
         self._queue_pending = {}
         self._bid_consumption = {}
@@ -4336,6 +4336,10 @@ cdef class OrderMatchingEngine:
 
         if self._queue_position and delta._mem.action == BookAction.DELETE:
             self._clear_queue_on_delete(delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side)
+        elif self._queue_position and delta._mem.action == BookAction.UPDATE:
+            self._update_queue_on_change(
+                delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side, delta._mem.order.size.raw,
+            )
 
         self._book.apply_delta(delta)
 
@@ -4402,6 +4406,10 @@ cdef class OrderMatchingEngine:
 
             if self._queue_position and delta._mem.action == BookAction.DELETE:
                 self._clear_queue_on_delete(delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side)
+            elif self._queue_position and delta._mem.action == BookAction.UPDATE:
+                self._update_queue_on_change(
+                    delta._mem.order.order_id, delta._mem.order.price.raw, delta._mem.order.side, delta._mem.order.size.raw,
+                )
 
         # Reset consumption tracking on snapshot (F_SNAPSHOT = 32) or CLEAR action
         if self._liquidity_consumption and has_snapshot_or_clear:
@@ -7045,9 +7053,7 @@ cdef class OrderMatchingEngine:
                 self._queue_pending[order.client_order_id] = price._mem.raw
                 return
 
-        # L3 (per-order identity): record the order_ids resting ahead of us in FIFO order,
-        # so a per-order DELETE advances us only if that specific order was genuinely ahead
-        # (not on any delete at the level, which is optimistic). Mirrors queue_model.py.
+        # L3: track the order_ids resting ahead so only a genuine per-order DELETE advances us.
         cdef dict ahead_ids
         if self.book_type == BookType.L3_MBO:
             ahead_ids = self._collect_ahead_ids(order.side, price)
@@ -7057,8 +7063,7 @@ cdef class OrderMatchingEngine:
         self._queue_ahead[order.client_order_id] = (price._mem.raw, ahead_raw)
 
     cdef dict _collect_ahead_ids(self, OrderSide order_side, Price price):
-        # Orders resting ahead of ours at `price` on our own side, in book (FIFO) order.
-        # Our own simulated order is not in the book, so every order at this level is ahead.
+        # Same-side orders resting ahead at price, in book (FIFO) order; our own order is not in the book.
         cdef:
             list levels
             PriceRaw target = price._mem.raw
@@ -7101,19 +7106,37 @@ cdef class OrderMatchingEngine:
                 continue
             ahead_ids = self._queue_ahead_ids.get(client_order_id)
             if ahead_ids is not None:
-                # L3: advance ONLY if the deleted order was genuinely ahead of us. A delete
-                # of an order behind us (or not tracked) leaves our position unchanged.
+                # L3: advance only if the deleted order was actually ahead of us.
                 if deleted_order_id in ahead_ids:
                     del ahead_ids[deleted_order_id]
                     self._queue_ahead[client_order_id] = (order_price_raw, self._sum_ahead_ids(ahead_ids))
             else:
-                # Non-L3 (no per-order identity): preserve the legacy clear-on-delete.
-                self._queue_ahead[client_order_id] = (order_price_raw, 0)
+                self._queue_ahead[client_order_id] = (order_price_raw, 0)  # non-L3: legacy clear
+
+    cdef void _update_queue_on_change(self, uint64_t updated_order_id, PriceRaw updated_price_raw, OrderSide updated_side, QuantityRaw new_size_raw):
+        # L3: resize an ahead order in place on UPDATE (e.g. partial cancel); non-positive removes it.
+        cdef:
+            ClientOrderId client_order_id
+            PriceRaw order_price_raw
+            Order order
+            dict ahead_ids
+        for client_order_id in list(self._queue_ahead):
+            order_price_raw, _ = self._queue_ahead[client_order_id]
+            if order_price_raw != updated_price_raw:
+                continue
+            order = self._core.get_order(client_order_id)
+            if order is None or order.side != updated_side:
+                continue
+            ahead_ids = self._queue_ahead_ids.get(client_order_id)
+            if ahead_ids is not None and updated_order_id in ahead_ids:
+                if new_size_raw > 0:
+                    ahead_ids[updated_order_id] = new_size_raw
+                else:
+                    del ahead_ids[updated_order_id]
+                self._queue_ahead[client_order_id] = (order_price_raw, self._sum_ahead_ids(ahead_ids))
 
     cdef void _clear_all_queue_positions(self):
-        # On a snapshot/CLEAR the prior depth (and per-order identity) no longer exists.
-        # Drop tracked identity; orders revert to front (as in the legacy behavior). L3
-        # snapshots occur at session start, before our orders rest, so this is benign.
+        # Snapshot/CLEAR: prior identity no longer exists; drop it (orders revert to front, as before).
         cdef:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
@@ -7151,8 +7174,7 @@ cdef class OrderMatchingEngine:
                    (aggressor_side == AggressorSide.SELLER and order.side == OrderSide.BUY):
                     ahead_ids = self._queue_ahead_ids.get(client_order_id)
                     if ahead_ids is not None:
-                        # L3: the aggressor consumes resting orders strictly front-first
-                        # (time priority), so everyone ahead of us clears before we fill.
+                        # L3: consume the queue front-first (time priority).
                         remaining = trade_size_raw
                         for oid in list(ahead_ids):
                             if remaining <= 0:
@@ -7218,6 +7240,7 @@ cdef class OrderMatchingEngine:
             order = self._core.get_order(client_order_id)
             if order is None or order.is_closed_c():
                 self._queue_ahead.pop(client_order_id, None)
+                self._queue_ahead_ids.pop(client_order_id, None)
                 continue
 
             if order.side != order_side:
@@ -7681,6 +7704,7 @@ cdef class OrderMatchingEngine:
 
         if self._queue_position and order.is_closed_c():
             self._queue_ahead.pop(order.client_order_id, None)
+            self._queue_ahead_ids.pop(order.client_order_id, None)
 
     cdef void _generate_spread_leg_fills(
         self,
@@ -8219,6 +8243,7 @@ cdef class OrderMatchingEngine:
             self._cancel_contingent_orders(order)
 
         self._queue_ahead.pop(order.client_order_id, None)
+        self._queue_ahead_ids.pop(order.client_order_id, None)
         self._generate_order_expired(order)
 
     cpdef void cancel_order(self, Order order, bint cancel_contingencies=True):
@@ -8231,6 +8256,7 @@ cdef class OrderMatchingEngine:
         self._core.delete_order(order)
         self._cached_filled_qty.pop(order.client_order_id, None)
         self._queue_ahead.pop(order.client_order_id, None)
+        self._queue_ahead_ids.pop(order.client_order_id, None)
 
         self._generate_order_canceled(order, venue_order_id=self._get_venue_order_id(order))
 

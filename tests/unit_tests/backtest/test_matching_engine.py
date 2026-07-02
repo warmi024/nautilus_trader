@@ -11957,15 +11957,8 @@ class TestOrderMatchingEngineQuoteQuantity:
 
 
 class TestOrderMatchingEngineL3QueuePosition:
-    # Per-order queue-position fidelity on L3 (MBO) data.
-    #
-    # With `queue_position=True`, `_clear_queue_on_delete` previously cleared an order's
-    # ENTIRE quantity-ahead on ANY per-order DELETE at its price/side. On an L3 feed every
-    # stranger's cancel is a per-order DELETE, so a single unrelated cancel front-of-queued
-    # the order and the next trade filled it early -- contradicting the `queue_position`
-    # docstring, which clears only when the price LEVEL is deleted. The engine now tracks
-    # the identity (order_ids) of the orders resting ahead and advances only when a specific
-    # one is genuinely gone. These tests pin that behaviour (they fail on the old heuristic).
+    # Per-order queue-position fidelity on L3 (MBO) data: a per-order DELETE/UPDATE only
+    # advances a resting order when the specific order ahead of it is gone.
 
     def setup(self):
         self.clock = TestClock()
@@ -12084,3 +12077,33 @@ class TestOrderMatchingEngineL3QueuePosition:
         fills = [m for m in messages if isinstance(m, OrderFilled)]
         assert len(fills) == 1
         assert fills[0].last_qty == self.instrument.make_qty(5.0)
+
+    def test_update_partial_cancel_advances_queue(self) -> None:
+        # A stranger ahead partially cancels via UPDATE (5 -> 2), leaving 7 ahead; an 8-lot
+        # trade clears the 7 and overflows 1 into us -> fill 1.
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._delta(engine, BookAction.UPDATE, 1, "100.00", "2.000", 3)
+        self._trade(engine, 8.0)
+
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert len(fills) == 1
+        assert fills[0].last_qty == self.instrument.make_qty(1.0)
+
+    def test_trade_before_delete_does_not_front_run(self) -> None:
+        # A fill arrives as a trade plus the filled makers' DELETEs. With the trade applied
+        # first (as a faithful feed orders same-timestamp events), the 10-lot trade consumes
+        # both strangers exactly and their subsequent DELETEs are no-ops -> NO fill.
+        engine = self._engine()
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        self._rest_behind_two_strangers(engine, messages)
+
+        self._trade(engine, 10.0)
+        self._delta(engine, BookAction.DELETE, 1, "100.00", "5.000", 3)
+        self._delta(engine, BookAction.DELETE, 2, "100.00", "5.000", 4)
+
+        assert [m for m in messages if isinstance(m, OrderFilled)] == []
